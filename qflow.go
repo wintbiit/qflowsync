@@ -96,7 +96,7 @@ func (c *QFlowClient) Map(r *FilterResponse) []map[string]string {
 			return answer.QueTitle, answer.Values[0].Value
 		})
 
-		m["URL"] = fmt.Sprintf("https://qingflow.com/appView/%s/shareView/%s?applyId=%s", c.appId, c.viewId, item.ApplyId)
+		m["URL"] = fmt.Sprintf("https://qingflow.com/appView/%s/shareView/%s?applyId=%d", c.appId, c.viewId, item.ApplyId)
 
 		return m
 	})
