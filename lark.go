@@ -54,12 +54,14 @@ func (c *LarkClient) WriteRecord(ctx context.Context, rec map[string]string) err
 	return err
 }
 
+var tzLocation = time.FixedZone("CST", 8*60*60)
+
 func parseFields(fields map[string]string) map[string]interface{} {
 	return lo.MapEntries(fields, func(k string, v string) (string, interface{}) {
 		k = strings.TrimSpace(k)
 		if k == UpdateTimeFieldName || k == CreateTimeFieldName {
 			// 2024-11-24 20:15:35
-			t, err := time.Parse("2006-01-02 15:04:05", v)
+			t, err := time.ParseInLocation("2006-01-02 15:04:05", v, tzLocation)
 			if err != nil {
 				log.Error().Err(err).Str("time", v).Msg("Failed to parse time")
 				t = time.Now()
