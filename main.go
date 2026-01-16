@@ -6,105 +6,88 @@ import (
 	"math"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/rs/zerolog/log"
 )
-
-const JobTimeout = 5 * time.Minute
 
 var dryRun = os.Getenv("DRY_RUN") == "true"
 
 func main() {
 	config := MustLoadConfig()
-	interval, err := time.ParseDuration(config.Interval)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to parse interval")
-	}
 
 	larkClient := NewLarkClient(config.Lark.AppId, config.Lark.AppSecret, config.Lark.AppToken, config.Lark.TableId)
 
-	qfClinet, err := NewQFlowClient(config.QFlow.AppId, config.QFlow.ViewId)
+	qfClient, err := NewQFlowClient(config.QFlow.AppId, config.QFlow.ViewId, config.QFlow.Cookies)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to create QingFlow client")
 	}
-	defer qfClinet.Close()
+	defer qfClient.Close()
 
 	if dryRun {
 		log.Warn().Msg("Dry run mode")
-		resp, err := qfClinet.GetValue(context.Background(), 1, 1)
+		resp, err := qfClient.GetValue(context.Background(), 1, 1)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to get value")
 		}
 
-		m := qfClinet.Map(resp)[0]
+		m := qfClient.Map(resp)[0]
 		j, _ := json.MarshalIndent(m, "", "  ")
 		log.Info().Msgf("Dry run data: \n%s", j)
 		return
 	}
 
-	job := func(ctx context.Context) {
-		log.Info().Msg("Starting job")
+	log.Info().Msg("Starting job")
 
-		resp, err := qfClinet.GetValue(ctx, 1, 50)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to get value")
-			return
-		}
+	ctx := context.Background()
+	resp, err := qfClient.GetValue(ctx, 1, 50)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to get value")
+		os.Exit(1)
+		return
+	}
 
-		jobForResp := func(ctx context.Context, resp *FilterResponse) {
-			m := qfClinet.Map(resp)
-
-			var wg sync.WaitGroup
-			wg.Add(len(m))
-			for _, item := range m {
-				go func(item map[string]string) {
-					defer wg.Done()
-
-					err := larkClient.WriteRecord(ctx, item)
-					if err != nil {
-						log.Error().Err(err).Msg("Failed to write record")
-					}
-				}(item)
-			}
-
-			wg.Wait()
-		}
+	jobForResp := func(ctx context.Context, resp *FilterResponse) {
+		m := qfClient.Map(resp)
 
 		var wg sync.WaitGroup
-		pageNum := int(math.Ceil(float64(resp.Data.Total) / 50))
-		wg.Add(pageNum)
-		for i := 2; i <= pageNum; i++ {
-			go func(i int) {
+		wg.Add(len(m))
+		for _, item := range m {
+			go func(item map[string]string) {
 				defer wg.Done()
 
-				resp, err := qfClinet.GetValue(ctx, i, 50)
+				err := larkClient.WriteRecord(ctx, item)
 				if err != nil {
-					log.Error().Err(err).Msg("Failed to get value")
-					return
+					log.Error().Err(err).Msg("Failed to write record")
 				}
-
-				jobForResp(ctx, resp)
-			}(i)
+			}(item)
 		}
 
-		go func() {
-			defer wg.Done()
-			jobForResp(ctx, resp)
-		}()
-
 		wg.Wait()
-
-		log.Info().Msg("Job done")
 	}
 
-	job(context.Background())
+	var wg sync.WaitGroup
+	pageNum := int(math.Ceil(float64(resp.Data.Total) / 50))
+	wg.Add(pageNum)
+	for i := 2; i <= pageNum; i++ {
+		go func(i int) {
+			defer wg.Done()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), JobTimeout)
-		job(ctx)
-		cancel()
+			resp, err := qfClient.GetValue(ctx, i, 50)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to get value")
+				return
+			}
+
+			jobForResp(ctx, resp)
+		}(i)
 	}
+
+	go func() {
+		defer wg.Done()
+		jobForResp(ctx, resp)
+	}()
+
+	wg.Wait()
+
+	log.Info().Msg("Job done")
 }

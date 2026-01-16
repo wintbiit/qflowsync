@@ -8,6 +8,7 @@ require (
 	github.com/rs/zerolog v1.33.0
 	github.com/samber/lo v1.47.0
 	golang.org/x/time v0.8.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

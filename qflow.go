@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 	"golang.org/x/time/rate"
 )
@@ -26,41 +24,28 @@ type QFlowClient struct {
 	viewId string
 }
 
-func NewQFlowClient(appId, viewId string) (*QFlowClient, error) {
+func NewQFlowClient(appId, viewId, cookies string) (*QFlowClient, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create cookie jar")
 	}
 
-	if _, err = os.Stat("cookie.txt"); err == nil {
-		f, err := os.Open("cookie.txt")
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to open cookie file")
-		}
-
-		content, err := io.ReadAll(f)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to read cookie file")
-		}
-
-		cookies := lo.Map(strings.Split(string(content), ";"), func(s string, i int) *http.Cookie {
-			pair := strings.TrimSpace(s)
-			sp := strings.SplitN(pair, "=", 2)
-			if len(sp) != 2 {
-				return &http.Cookie{
-					Name:  pair,
-					Value: "",
-				}
-			}
+	ck := lo.Map(strings.Split(cookies, ";"), func(s string, i int) *http.Cookie {
+		pair := strings.TrimSpace(s)
+		sp := strings.SplitN(pair, "=", 2)
+		if len(sp) != 2 {
 			return &http.Cookie{
-				Name:  sp[0],
-				Value: sp[1],
+				Name:  pair,
+				Value: "",
 			}
-		})
+		}
+		return &http.Cookie{
+			Name:  sp[0],
+			Value: sp[1],
+		}
+	})
 
-		jar.SetCookies(&qfUrl, cookies)
-		log.Info().Msg("successfully loaded cookies from file")
-	}
+	jar.SetCookies(&qfUrl, ck)
 
 	client := http.Client{Jar: jar}
 
