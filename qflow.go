@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 	"golang.org/x/time/rate"
 )
@@ -24,28 +25,49 @@ type QFlowClient struct {
 	viewId string
 }
 
+func validCookieValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		// RFC 6265 cookie-octet, same as net/http.validCookieValueByte
+		if b < 0x20 || b >= 0x7f || b == '"' || b == ';' || b == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
+func parseCookies(cookies string) []*http.Cookie {
+	var out []*http.Cookie
+	for _, part := range strings.Split(cookies, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		name, value, ok := strings.Cut(part, "=")
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if !ok || name == "" {
+			log.Warn().Str("cookie", part).Msg("Skipping malformed cookie")
+			continue
+		}
+		if !validCookieValue(value) {
+			log.Warn().Str("name", name).Msg("Skipping cookie with invalid characters in value")
+			continue
+		}
+
+		out = append(out, &http.Cookie{Name: name, Value: value})
+	}
+	return out
+}
+
 func NewQFlowClient(appId, viewId, cookies string) (*QFlowClient, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create cookie jar")
 	}
 
-	ck := lo.Map(strings.Split(cookies, ";"), func(s string, i int) *http.Cookie {
-		pair := strings.TrimSpace(s)
-		sp := strings.SplitN(pair, "=", 2)
-		if len(sp) != 2 {
-			return &http.Cookie{
-				Name:  pair,
-				Value: "",
-			}
-		}
-		return &http.Cookie{
-			Name:  sp[0],
-			Value: sp[1],
-		}
-	})
-
-	jar.SetCookies(&qfUrl, ck)
+	jar.SetCookies(&qfUrl, parseCookies(cookies))
 
 	client := http.Client{Jar: jar}
 
@@ -144,10 +166,18 @@ func (c *QFlowClient) GetValue(ctx context.Context, page int, size int) (*Filter
 
 	defer resp.Body.Close()
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, errors.Errorf("qingflow http status %d", resp.StatusCode)
+	}
+
 	var filterResp FilterResponse
 	err = json.NewDecoder(resp.Body).Decode(&filterResp)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to decode response")
+	}
+
+	if filterResp.Code != 0 && filterResp.Code != 200 {
+		return nil, errors.Errorf("qingflow api code=%d message=%s", filterResp.Code, filterResp.Message)
 	}
 
 	return &filterResp, nil

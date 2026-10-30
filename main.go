@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"os"
 	"sync"
 
@@ -36,13 +35,21 @@ func main() {
 		return
 	}
 
+	const pageSize = 50
+
 	log.Info().Msg("Starting job")
 
 	ctx := context.Background()
-	resp, err := qfClient.GetValue(ctx, 1, 50)
+	resp, err := qfClient.GetValue(ctx, 1, pageSize)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to get value")
 		os.Exit(1)
+		return
+	}
+
+	total := resp.Data.Total
+	if total == 0 {
+		log.Info().Msg("No records to sync")
 		return
 	}
 
@@ -65,27 +72,30 @@ func main() {
 		wg.Wait()
 	}
 
+	pageNum := (total + pageSize - 1) / pageSize
+	log.Info().Int("total", total).Int("pages", pageNum).Msg("Fetched first page")
+
 	var wg sync.WaitGroup
-	pageNum := int(math.Ceil(float64(resp.Data.Total) / 50))
-	wg.Add(pageNum)
-	for i := 2; i <= pageNum; i++ {
-		go func(i int) {
-			defer wg.Done()
-
-			resp, err := qfClient.GetValue(ctx, i, 50)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to get value")
-				return
-			}
-
-			jobForResp(ctx, resp)
-		}(i)
-	}
-
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		jobForResp(ctx, resp)
 	}()
+
+	for i := 2; i <= pageNum; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			page, err := qfClient.GetValue(ctx, i, pageSize)
+			if err != nil {
+				log.Error().Err(err).Int("page", i).Msg("Failed to get value")
+				return
+			}
+
+			jobForResp(ctx, page)
+		}(i)
+	}
 
 	wg.Wait()
 
