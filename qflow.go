@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -128,7 +129,7 @@ func (c *QFlowClient) Close() error {
 	return nil
 }
 
-var qflowGetValueLimiter = rate.NewLimiter(rate.Every(1*time.Second), 1)
+var qflowGetValueLimiter = rate.NewLimiter(10, 1)
 
 func (c *QFlowClient) GetValue(ctx context.Context, page int, size int) (*FilterResponse, error) {
 	if err := qflowGetValueLimiter.Wait(ctx); err != nil {
@@ -181,4 +182,71 @@ func (c *QFlowClient) GetValue(ctx context.Context, page int, size int) (*Filter
 	}
 
 	return &filterResp, nil
+}
+
+// AllRecords fetches independent pages concurrently and assembles them in page order.
+func (c *QFlowClient) AllRecords(ctx context.Context) ([]map[string]string, error) {
+	const pageSize, concurrentPages = 50, 10
+	first, err := c.GetValue(ctx, 1, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("page 1: %w", err)
+	}
+	expected := first.Data.Total
+	if expected < 0 {
+		return nil, fmt.Errorf("invalid QingFlow record total %d", expected)
+	}
+	pageCount := 1
+	if expected > 0 {
+		pageCount = (expected-1)/pageSize + 1
+	}
+	pages := make([]*FilterResponse, pageCount)
+	pages[0] = first
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var workers sync.WaitGroup
+	var fetchErr error
+	var fail sync.Once
+	for worker := 0; worker < concurrentPages && worker < pageCount-1; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			for page := worker + 2; page <= pageCount; page += concurrentPages {
+				if ctx.Err() != nil {
+					return
+				}
+				resp, err := c.GetValue(ctx, page, pageSize)
+				if err != nil {
+					fail.Do(func() {
+						fetchErr = fmt.Errorf("page %d: %w", page, err)
+						cancel()
+					})
+					return
+				}
+				pages[page-1] = resp
+			}
+		}(worker)
+	}
+	workers.Wait()
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	records := make([]map[string]string, 0, expected)
+	for i, page := range pages {
+		want := pageSize
+		if remaining := expected - i*pageSize; remaining < want {
+			want = remaining
+		}
+		if page.Data.Total != expected || len(page.Data.List) != want {
+			return nil, fmt.Errorf("QingFlow pagination changed on page %d: total %d/%d, rows %d/%d",
+				i+1, page.Data.Total, expected, len(page.Data.List), want)
+		}
+		records = append(records, c.Map(page)...)
+	}
+	log.Info().Int("pages", pageCount).Int("records", len(records)).Msg("Fetched QingFlow")
+	return records, nil
 }

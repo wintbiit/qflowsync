@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,15 +22,20 @@ import (
 
 type LarkClient struct {
 	*lark.Client
-	AppToken string
-	TableId  string
+	AppToken                              string
+	TableId                               string
+	searchLimit, createLimit, updateLimit *rate.Limiter
 }
 
-func NewLarkClient(appId, appSecret, appToken, tableId string) *LarkClient {
+func NewLarkClient(appId, appSecret, appToken, tableId string, options ...lark.ClientOptionFunc) *LarkClient {
+	options = append([]lark.ClientOptionFunc{lark.WithHttpClient(feishuHTTPClient{&http.Client{Timeout: 20 * time.Second}})}, options...)
 	return &LarkClient{
-		Client:   lark.NewClient(appId, appSecret, lark.WithReqTimeout(20*time.Second)),
-		AppToken: appToken,
-		TableId:  tableId,
+		Client:      lark.NewClient(appId, appSecret, options...),
+		AppToken:    appToken,
+		TableId:     tableId,
+		searchLimit: rate.NewLimiter(20, 1),
+		createLimit: rate.NewLimiter(50, 1),
+		updateLimit: rate.NewLimiter(50, 1),
 	}
 }
 
@@ -38,47 +45,101 @@ const (
 	CreateTimeFieldName = "申请时间"
 )
 
-func (c *LarkClient) WriteRecord(ctx context.Context, recordID string, rec map[string]string) (bool, error) {
-	fields := parseFields(rec)
-	if recordID != "" {
-		return false, retryLark(ctx, "update", func() error {
-			return c.UpdateRecord(ctx, recordID, fields)
-		})
-	}
-
+func (c *LarkClient) CreateBatch(ctx context.Context, records []*larkbitable.AppTableRecord) error {
 	var token [16]byte
 	if _, err := rand.Read(token[:]); err != nil {
-		return false, err
+		return err
 	}
 	token[6] = token[6]&0x0f | 0x40
 	token[8] = token[8]&0x3f | 0x80
 	clientToken := fmt.Sprintf("%x-%x-%x-%x-%x", token[:4], token[4:6], token[6:8], token[8:10], token[10:])
-	err := retryLark(ctx, "create", func() error {
-		_, err := c.CreateRecord(ctx, fields, clientToken)
-		return err
+	req := larkbitable.NewBatchCreateAppTableRecordReqBuilder().
+		AppToken(c.AppToken).TableId(c.TableId).ClientToken(clientToken).
+		Body(larkbitable.NewBatchCreateAppTableRecordReqBodyBuilder().Records(records).Build()).Build()
+	return retryFeishu(ctx, "batch_create", c.createLimit, func() error {
+		resp, err := c.Bitable.AppTableRecord.BatchCreate(ctx, req)
+		if err != nil {
+			return err
+		}
+		if err := feishuResponseError(resp.ApiResp, resp.CodeError); err != nil {
+			return err
+		}
+		if resp.Data == nil || len(resp.Data.Records) != len(records) {
+			return fmt.Errorf("unexpected Feishu create response count, expected %d", len(records))
+		}
+		return nil
 	})
-	return err == nil, err
 }
 
-func retryLark(ctx context.Context, operation string, call func() error) error {
+func (c *LarkClient) UpdateBatch(ctx context.Context, records []*larkbitable.AppTableRecord) error {
+	req := larkbitable.NewBatchUpdateAppTableRecordReqBuilder().
+		AppToken(c.AppToken).TableId(c.TableId).
+		Body(larkbitable.NewBatchUpdateAppTableRecordReqBodyBuilder().Records(records).Build()).Build()
+	return retryFeishu(ctx, "batch_update", c.updateLimit, func() error {
+		resp, err := c.Bitable.AppTableRecord.BatchUpdate(ctx, req)
+		if err != nil {
+			return err
+		}
+		if err := feishuResponseError(resp.ApiResp, resp.CodeError); err != nil {
+			return err
+		}
+		if resp.Data == nil || len(resp.Data.Records) != len(records) {
+			return fmt.Errorf("unexpected Feishu update response count, expected %d", len(records))
+		}
+		return nil
+	})
+}
+
+// Keep the cooldown header even when an HTTP 429 response has no JSON body.
+type feishuHTTPClient struct{ *http.Client }
+
+func (c feishuHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	resp, err := c.Client.Do(req)
+	if err == nil && resp.StatusCode == http.StatusTooManyRequests {
+		defer resp.Body.Close()
+		return nil, &feishuError{status: resp.StatusCode, retryAfter: resp.Header.Get("x-ogw-ratelimit-reset")}
+	}
+	return resp, err
+}
+
+type feishuError struct {
+	status     int
+	code       larkcore.CodeError
+	retryAfter string
+}
+
+func (e *feishuError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.status, e.code.Error())
+}
+
+func feishuResponseError(resp *larkcore.ApiResp, code larkcore.CodeError) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && code.Code == 0 {
+		return nil
+	}
+	return &feishuError{status: resp.StatusCode, code: code, retryAfter: resp.Header.Get("x-ogw-ratelimit-reset")}
+}
+
+func retryFeishu(ctx context.Context, operation string, limiter *rate.Limiter, call func() error) error {
 	const maxAttempts = 5
-	delay := time.Second
 	for attempt := 1; ; attempt++ {
-		if err := ctx.Err(); err != nil {
+		if err := limiter.Wait(ctx); err != nil {
 			return err
 		}
 		err := call()
 		if err == nil {
 			return nil
 		}
-		var apiError larkcore.CodeError
-		if attempt == maxAttempts || !errors.As(err, &apiError) ||
-			(apiError.Code != 1254290 && apiError.Code != 1254607) {
+
+		var apiError *feishuError
+		if attempt == maxAttempts || !errors.As(err, &apiError) {
 			return fmt.Errorf("feishu %s after %d attempt(s): %w", operation, attempt, err)
 		}
-
-		log.Warn().Str("operation", operation).Int("code", apiError.Code).
-			Int("attempt", attempt).Dur("backoff", delay).Msg("Retrying Feishu request")
+		delay, retry := feishuRetryDelay(apiError, attempt)
+		if !retry {
+			return fmt.Errorf("feishu %s after %d attempt(s): %w", operation, attempt, err)
+		}
+		log.Warn().Str("operation", operation).Int("http_status", apiError.status).
+			Int("code", apiError.code.Code).Int("attempt", attempt).Dur("backoff", delay).Msg("Retrying Feishu request")
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -86,8 +147,21 @@ func retryLark(ctx context.Context, operation string, call func() error) error {
 			return ctx.Err()
 		case <-timer.C:
 		}
-		delay *= 2
 	}
+}
+
+func feishuRetryDelay(err *feishuError, attempt int) (time.Duration, bool) {
+	switch err.code.Code {
+	case 99991400, 1254290, 1254607, 1254291:
+	default:
+		if err.status != http.StatusTooManyRequests {
+			return 0, false
+		}
+	}
+	if seconds, parseErr := strconv.ParseInt(strings.TrimSpace(err.retryAfter), 10, 32); parseErr == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second, true
+	}
+	return time.Second << (attempt - 1), true
 }
 
 var tzLocation = time.FixedZone("CST", 8*60*60)
@@ -131,13 +205,13 @@ func (c *LarkClient) RecordIndex(ctx context.Context) (map[string][]string, erro
 			req.PageToken(token)
 		}
 		var data *larkbitable.SearchAppTableRecordRespData
-		if err := retryLark(ctx, "search", func() error {
+		if err := retryFeishu(ctx, "search", c.searchLimit, func() error {
 			resp, err := c.Bitable.AppTableRecord.Search(ctx, req.Build())
 			if err != nil {
 				return err
 			}
-			if !resp.Success() {
-				return resp.CodeError
+			if err := feishuResponseError(resp.ApiResp, resp.CodeError); err != nil {
+				return err
 			}
 			data = resp.Data
 			return nil
@@ -161,6 +235,7 @@ func (c *LarkClient) RecordIndex(ctx context.Context) (map[string][]string, erro
 			}
 		}
 		if data.HasMore == nil || !*data.HasMore {
+			log.Info().Int("pages", len(tokens)+1).Msg("Fetched Feishu index")
 			return index, nil
 		}
 		if data.PageToken == nil || *data.PageToken == "" || tokens[*data.PageToken] {
@@ -194,62 +269,4 @@ func feishuRecordNumber(value interface{}) (string, error) {
 	default:
 		return "", fmt.Errorf("unexpected Feishu record number type %T", value)
 	}
-}
-
-// Pace creates and updates through the same limiter.
-var writeRecordLimiter = rate.NewLimiter(5, 1)
-
-func (c *LarkClient) UpdateRecord(ctx context.Context, id string, fields map[string]interface{}) error {
-	if err := writeRecordLimiter.Wait(ctx); err != nil {
-		return err
-	}
-
-	req := larkbitable.NewUpdateAppTableRecordReqBuilder().
-		AppToken(c.AppToken).
-		TableId(c.TableId).
-		RecordId(id).
-		AppTableRecord(larkbitable.NewAppTableRecordBuilder().
-			RecordId(id).
-			Fields(fields).
-			Build()).
-		Build()
-
-	// 发起请求
-	resp, err := c.Bitable.AppTableRecord.Update(ctx, req)
-	if err != nil {
-		return err
-	}
-
-	if !resp.Success() {
-		return resp.CodeError
-	}
-
-	return nil
-}
-
-func (c *LarkClient) CreateRecord(ctx context.Context, fields map[string]interface{}, clientToken string) (string, error) {
-	if err := writeRecordLimiter.Wait(ctx); err != nil {
-		return "", err
-	}
-
-	req := larkbitable.NewCreateAppTableRecordReqBuilder().
-		AppToken(c.AppToken).
-		TableId(c.TableId).
-		ClientToken(clientToken).
-		AppTableRecord(larkbitable.NewAppTableRecordBuilder().
-			Fields(fields).
-			Build()).
-		Build()
-
-	// 发起请求
-	resp, err := c.Bitable.AppTableRecord.Create(ctx, req)
-	if err != nil {
-		return "", err
-	}
-
-	if !resp.Success() {
-		return "", resp.CodeError
-	}
-
-	return *resp.Data.Record.RecordId, nil
 }

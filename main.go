@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"time"
 
+	larkbitable "github.com/larksuite/oapi-sdk-go/v3/service/bitable/v1"
 	"github.com/rs/zerolog/log"
 )
 
@@ -30,7 +32,11 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to get value")
 		}
 
-		m := qfClient.Map(resp)[0]
+		records := qfClient.Map(resp)
+		if len(records) == 0 {
+			return
+		}
+		m := records[0]
 		j, _ := json.MarshalIndent(m, "", "  ")
 		log.Info().Msgf("Dry run data: \n%s", j)
 		return
@@ -46,107 +52,91 @@ func main() {
 
 func syncRecords(ctx context.Context, qfClient *QFlowClient, larkClient *LarkClient) bool {
 	started := time.Now()
-	const pageSize = 50
-	first, err := qfClient.GetValue(ctx, 1, pageSize)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	indexResult := make(chan struct {
+		index map[string][]string
+		err   error
+	}, 1)
+	go func() {
+		index, err := larkClient.RecordIndex(ctx)
+		indexResult <- struct {
+			index map[string][]string
+			err   error
+		}{index, err}
+	}()
+
+	records, err := qfClient.AllRecords(ctx)
 	if err != nil {
-		log.Error().Err(err).Int("page", 1).Msg("Failed to get value")
+		cancel()
+		<-indexResult
+		log.Error().Err(err).Msg("Failed to read QingFlow")
 		return false
 	}
-
-	expected := first.Data.Total
-	pages := (expected + pageSize - 1) / pageSize
-	log.Info().Int("pages", pages).Int("total", expected).Msg("Fetched first page")
-	records := make([]map[string]string, 0, expected)
-	numbers := make(map[string]struct{}, expected)
-	for page := 1; page <= pages; page++ {
-		resp := first
-		if page > 1 {
-			resp, err = qfClient.GetValue(ctx, page, pageSize)
-			if err != nil {
-				log.Error().Err(err).Int("page", page).Msg("Failed to get value")
-				return false
-			}
-		}
-		for _, item := range qfClient.Map(resp) {
-			number := strings.TrimSpace(item[IDFieldName])
-			_, duplicate := numbers[number]
-			if number == "" || duplicate {
-				log.Error().Int("page", page).Bool("duplicate", duplicate).Msg("Invalid QingFlow record number")
-				return false
-			}
-			numbers[number] = struct{}{}
-			records = append(records, item)
-		}
-		log.Info().Int("page", page).Int("pages", pages).Int("fetched", len(records)).
-			Int("expected", expected).Dur("elapsed", time.Since(started)).Msg("QingFlow fetch progress")
-	}
-	if len(records) != expected {
-		log.Error().Int("fetched", len(records)).Int("expected", expected).Msg("QingFlow record count changed during pagination")
+	destination := <-indexResult
+	if destination.err != nil {
+		log.Error().Err(destination.err).Msg("Failed to index Feishu records")
 		return false
 	}
-	if expected == 0 {
-		log.Info().Int("expected", 0).Bool("success", true).Msg("Sync summary")
-		return true
-	}
+	log.Info().Int("indexed", len(destination.index)).Dur("elapsed", time.Since(started)).Msg("Indexed Feishu records")
 
-	index, err := larkClient.RecordIndex(ctx)
+	create, update, err := recordBuckets(records, destination.index)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to index Feishu records")
+		log.Error().Err(err).Int("not_run", len(records)).Msg("Cannot build Feishu batches")
 		return false
 	}
-	log.Info().Int("indexed", len(index)).Dur("elapsed", time.Since(started)).Msg("Indexed Feishu records")
+	log.Info().Int("create", len(create)).Int("update", len(update)).Msg("Prepared Feishu batches")
+	created, failed := writeBatches(ctx, "batch_create", create, larkClient.CreateBatch)
+	updated := 0
+	if failed == 0 {
+		updated, failed = writeBatches(ctx, "batch_update", update, larkClient.UpdateBatch)
+	}
+	notRun := len(records) - created - updated - failed
+	log.Info().Int("expected", len(records)).Int("created", created).Int("updated", updated).
+		Int("failed", failed).Int("not_run", notRun).Dur("elapsed", time.Since(started)).
+		Bool("success", failed == 0).Msg("Sync summary")
+	return failed == 0
+}
 
-	var created, updated, failed int
-	writeStarted := time.Now()
+func recordBuckets(records []map[string]string, index map[string][]string) (create, update []*larkbitable.AppTableRecord, err error) {
+	numbers := make(map[string]bool, len(records))
 	for i, item := range records {
 		number := strings.TrimSpace(item[IDFieldName])
+		if number == "" || numbers[number] {
+			return nil, nil, fmt.Errorf("missing or duplicate QingFlow number at record %d", i+1)
+		}
+		numbers[number] = true
 		matches := index[number]
-		if len(matches) > 1 {
-			failed++
-			log.Error().Int("record", i+1).Int("matches", len(matches)).Msg("Duplicate Feishu record number")
-		} else {
-			recordID := ""
-			if len(matches) == 1 {
-				recordID = matches[0]
-			}
-			wasCreated, err := larkClient.WriteRecord(ctx, recordID, item)
-			switch {
-			case err != nil:
-				failed++
-				log.Error().Err(err).Int("record", i+1).Msg("Failed to write record")
-			case wasCreated:
-				created++
-			default:
-				updated++
-			}
-		}
-		if done := i + 1; done%25 == 0 || done == expected {
-			log.Info().Int("processed", done).Int("expected", expected).
-				Int("created", created).Int("updated", updated).Int("failed", failed).
-				Dur("elapsed", time.Since(writeStarted)).Msg("Feishu write progress")
+		record := larkbitable.NewAppTableRecordBuilder().Fields(parseFields(item))
+		switch len(matches) {
+		case 0:
+			create = append(create, record.Build())
+		case 1:
+			update = append(update, record.RecordId(matches[0]).Build())
+		default:
+			return nil, nil, fmt.Errorf("QingFlow record %d matches %d Feishu records", i+1, len(matches))
 		}
 	}
+	return create, update, nil
+}
 
-	verified, missing, duplicates := 0, 0, 0
-	index, err = larkClient.RecordIndex(ctx)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to verify Feishu records")
-	} else {
-		for number := range numbers {
-			switch len(index[number]) {
-			case 0:
-				missing++
-			case 1:
-				verified++
-			default:
-				duplicates++
-			}
+func writeBatches(ctx context.Context, operation string, records []*larkbitable.AppTableRecord, write func(context.Context, []*larkbitable.AppTableRecord) error) (done, failed int) {
+	const batchSize = 500
+	for batch := 1; done < len(records); batch++ {
+		size := batchSize
+		if remaining := len(records) - done; remaining < size {
+			size = remaining
 		}
+		started := time.Now()
+		if err := write(ctx, records[done:done+size]); err != nil {
+			log.Error().Err(err).Str("operation", operation).Int("batch", batch).
+				Int("records", size).Dur("elapsed", time.Since(started)).Msg("Feishu batch failed")
+			return done, size
+		}
+		log.Info().Str("operation", operation).Int("batch", batch).Int("records", size).
+			Dur("elapsed", time.Since(started)).Msg("Feishu batch completed")
+		done += size
 	}
-	success := failed == 0 && verified == expected
-	log.Info().Int("expected", expected).Int("created", created).Int("updated", updated).
-		Int("failed", failed).Int("verified", verified).Int("missing", missing).
-		Int("duplicates", duplicates).Bool("readback_ok", err == nil).
-		Dur("elapsed", time.Since(started)).Bool("success", success).Msg("Sync summary")
-	return success
+	return done, 0
 }
