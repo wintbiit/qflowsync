@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkbitable "github.com/larksuite/oapi-sdk-go/v3/service/bitable/v1"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
@@ -33,25 +38,71 @@ const (
 	CreateTimeFieldName = "申请时间"
 )
 
-func (c *LarkClient) WriteRecord(ctx context.Context, rec map[string]string) error {
-	id, ok := rec[IDFieldName]
-	if !ok {
-		return nil
+func (c *LarkClient) WriteRecord(ctx context.Context, rec map[string]string) (bool, error) {
+	id := rec[IDFieldName]
+	if strings.TrimSpace(id) == "" {
+		return false, errors.New("missing record number")
 	}
 
-	exists, recordId, err := c.RecordExists(ctx, id)
-	if err != nil {
+	var exists bool
+	var recordID string
+	if err := retryLark(ctx, "search", func() error {
+		var err error
+		exists, recordID, err = c.RecordExists(ctx, id)
 		return err
+	}); err != nil {
+		return false, err
 	}
 
 	fields := parseFields(rec)
-
 	if exists {
-		return c.UpdateRecord(ctx, recordId, fields)
+		return false, retryLark(ctx, "update", func() error {
+			return c.UpdateRecord(ctx, recordID, fields)
+		})
 	}
 
-	_, err = c.CreateRecord(ctx, fields)
-	return err
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return false, err
+	}
+	token[6] = token[6]&0x0f | 0x40
+	token[8] = token[8]&0x3f | 0x80
+	clientToken := fmt.Sprintf("%x-%x-%x-%x-%x", token[:4], token[4:6], token[6:8], token[8:10], token[10:])
+	err := retryLark(ctx, "create", func() error {
+		_, err := c.CreateRecord(ctx, fields, clientToken)
+		return err
+	})
+	return err == nil, err
+}
+
+func retryLark(ctx context.Context, operation string, call func() error) error {
+	const maxAttempts = 5
+	delay := time.Second
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := call()
+		if err == nil {
+			return nil
+		}
+		var apiError larkcore.CodeError
+		if attempt == maxAttempts || !errors.As(err, &apiError) ||
+			(apiError.Code != 1254290 && apiError.Code != 1254607) {
+			return fmt.Errorf("feishu %s after %d attempt(s): %w", operation, attempt, err)
+		}
+
+		log.Warn().Str("operation", operation).Int("code", apiError.Code).
+			Int("attempt", attempt).Dur("backoff", delay).Msg("Retrying Feishu request")
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		delay *= 2
+	}
 }
 
 var tzLocation = time.FixedZone("CST", 8*60*60)
@@ -78,7 +129,7 @@ func parseFields(fields map[string]string) map[string]interface{} {
 	})
 }
 
-// 20 times per second
+// 15 searches per second.
 var recordExistsLimiter = rate.NewLimiter(rate.Every(time.Second/15), 1)
 
 func (c *LarkClient) RecordExists(ctx context.Context, id string) (bool, string, error) {
@@ -111,7 +162,7 @@ func (c *LarkClient) RecordExists(ctx context.Context, id string) (bool, string,
 	}
 
 	if !resp.Success() {
-		return false, "", resp
+		return false, "", resp.CodeError
 	}
 
 	if len(resp.Data.Items) == 0 {
@@ -121,11 +172,11 @@ func (c *LarkClient) RecordExists(ctx context.Context, id string) (bool, string,
 	return true, *resp.Data.Items[0].RecordId, nil
 }
 
-// 50 times per second
-var updateRecordLimiter = rate.NewLimiter(rate.Every(time.Second/40), 1)
+// Pace creates and updates through the same limiter.
+var writeRecordLimiter = rate.NewLimiter(5, 1)
 
 func (c *LarkClient) UpdateRecord(ctx context.Context, id string, fields map[string]interface{}) error {
-	if err := updateRecordLimiter.Wait(ctx); err != nil {
+	if err := writeRecordLimiter.Wait(ctx); err != nil {
 		return err
 	}
 
@@ -146,23 +197,21 @@ func (c *LarkClient) UpdateRecord(ctx context.Context, id string, fields map[str
 	}
 
 	if !resp.Success() {
-		return resp
+		return resp.CodeError
 	}
 
 	return nil
 }
 
-// 50 times per second
-var createRecordLimiter = rate.NewLimiter(rate.Every(time.Second/40), 1)
-
-func (c *LarkClient) CreateRecord(ctx context.Context, fields map[string]interface{}) (string, error) {
-	if err := createRecordLimiter.Wait(ctx); err != nil {
+func (c *LarkClient) CreateRecord(ctx context.Context, fields map[string]interface{}, clientToken string) (string, error) {
+	if err := writeRecordLimiter.Wait(ctx); err != nil {
 		return "", err
 	}
 
 	req := larkbitable.NewCreateAppTableRecordReqBuilder().
 		AppToken(c.AppToken).
 		TableId(c.TableId).
+		ClientToken(clientToken).
 		AppTableRecord(larkbitable.NewAppTableRecordBuilder().
 			Fields(fields).
 			Build()).
@@ -175,7 +224,7 @@ func (c *LarkClient) CreateRecord(ctx context.Context, fields map[string]interfa
 	}
 
 	if !resp.Success() {
-		return "", resp
+		return "", resp.CodeError
 	}
 
 	return *resp.Data.Record.RecordId, nil
