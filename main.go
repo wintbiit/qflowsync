@@ -55,16 +55,19 @@ func syncRecords(ctx context.Context, qfClient *QFlowClient, larkClient *LarkCli
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	indexResult := make(chan struct {
-		index map[string][]string
-		err   error
-	}, 1)
+	type destinationState struct {
+		index   map[string][]string
+		columns map[string]bool
+		err     error
+	}
+	indexResult := make(chan destinationState, 1)
 	go func() {
-		index, err := larkClient.RecordIndex(ctx)
-		indexResult <- struct {
-			index map[string][]string
-			err   error
-		}{index, err}
+		columns, err := larkClient.ColumnNames(ctx)
+		var index map[string][]string
+		if err == nil && columns[IDFieldName] {
+			index, err = larkClient.RecordIndex(ctx)
+		}
+		indexResult <- destinationState{index, columns, err}
 	}()
 
 	records, err := qfClient.AllRecords(ctx)
@@ -84,6 +87,10 @@ func syncRecords(ctx context.Context, qfClient *QFlowClient, larkClient *LarkCli
 	create, update, err := recordBuckets(records, destination.index)
 	if err != nil {
 		log.Error().Err(err).Int("not_run", len(records)).Msg("Cannot build Feishu batches")
+		return false
+	}
+	if err := larkClient.EnsureColumns(ctx, destination.columns, create, update); err != nil {
+		log.Error().Err(err).Int("not_run", len(records)).Msg("Failed to create Feishu columns")
 		return false
 	}
 	log.Info().Int("create", len(create)).Int("update", len(update)).Msg("Prepared Feishu batches")

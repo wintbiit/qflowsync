@@ -28,8 +28,8 @@ func TestFullSync(t *testing.T) {
 		badCreateCount bool
 		want           []string
 	}{
-		{"success", false, []string{"create:500", "create:1", "update:1"}},
-		{"failure", true, []string{"create:500"}},
+		{"success", false, []string{"field:URL", "create:500", "create:1", "update:1"}},
+		{"failure", true, []string{"field:URL", "create:500"}},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			const total = 502
@@ -58,6 +58,20 @@ func TestFullSync(t *testing.T) {
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/tenant_access_token/internal"):
 					fmt.Fprint(w, `{"code":0,"tenant_access_token":"test","expire":7200}`)
+				case strings.HasSuffix(r.URL.Path, "/fields") && r.Method == http.MethodGet:
+					fmt.Fprint(w, `{"code":0,"data":{"has_more":false,"items":[{"field_name":"编号","type":1}]}}`)
+				case strings.HasSuffix(r.URL.Path, "/fields") && r.Method == http.MethodPost:
+					var field larkbitable.AppTableField
+					if err := json.NewDecoder(r.Body).Decode(&field); err != nil || field.FieldName == nil || field.Type == nil {
+						t.Error("invalid create-field request")
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if *field.Type != 15 || r.URL.Query().Get("client_token") == "" {
+						t.Error("expected an idempotent link-column request")
+					}
+					calls <- "field:" + *field.FieldName
+					fmt.Fprint(w, `{"code":0,"data":{"field":{"field_name":"URL","type":15}}}`)
 				case strings.HasSuffix(r.URL.Path, "/search"):
 					fmt.Fprint(w, `{"code":0,"data":{"has_more":false,"items":[{"record_id":"first","fields":{"编号":"1"}}]}}`)
 				default:
@@ -163,7 +177,7 @@ func TestFeishuRetryPolicy(t *testing.T) {
 func TestSyncRecordTimes(t *testing.T) {
 	var source FilterResponseDataItem
 	if err := json.Unmarshal([]byte(`{
-		"applyBaseInfo":{"applyTime":"2026-11-16T16:33:20","lastUpdateTime":"2026-11-16T16:33:19"},
+		"applyBaseInfo":{"applyTime":"2026-11-16T16:33:20","lastUpdateTime":"2026-11-16T16:33:19","currentAuditNodes":[{"auditNodeName":"已通过"}]},
 		"lastUpdateTime":1794818000123
 	}`), &source); err != nil {
 		t.Fatal(err)
@@ -173,6 +187,9 @@ func TestSyncRecordTimes(t *testing.T) {
 	fields, err := parseFields(mapped[0])
 	if err != nil {
 		t.Fatal(err)
+	}
+	if fields[WorkflowFieldName] != "已通过" {
+		t.Fatal("missing workflow node name")
 	}
 	if fields[CreateTimeFieldName] != int64(1794818000000) || fields[UpdateTimeFieldName] != int64(1794818000123) {
 		t.Fatalf("incorrect timestamp conversion: created=%v updated=%v", fields[CreateTimeFieldName], fields[UpdateTimeFieldName])

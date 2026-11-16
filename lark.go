@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,17 +25,20 @@ type LarkClient struct {
 	AppToken                              string
 	TableId                               string
 	searchLimit, createLimit, updateLimit *rate.Limiter
+	listFieldLimit, createFieldLimit      *rate.Limiter
 }
 
 func NewLarkClient(appId, appSecret, appToken, tableId string, options ...lark.ClientOptionFunc) *LarkClient {
 	options = append([]lark.ClientOptionFunc{lark.WithHttpClient(feishuHTTPClient{&http.Client{Timeout: 20 * time.Second}})}, options...)
 	return &LarkClient{
-		Client:      lark.NewClient(appId, appSecret, options...),
-		AppToken:    appToken,
-		TableId:     tableId,
-		searchLimit: rate.NewLimiter(20, 1),
-		createLimit: rate.NewLimiter(50, 1),
-		updateLimit: rate.NewLimiter(50, 1),
+		Client:           lark.NewClient(appId, appSecret, options...),
+		AppToken:         appToken,
+		TableId:          tableId,
+		searchLimit:      rate.NewLimiter(20, 1),
+		createLimit:      rate.NewLimiter(50, 1),
+		updateLimit:      rate.NewLimiter(50, 1),
+		listFieldLimit:   rate.NewLimiter(20, 1),
+		createFieldLimit: rate.NewLimiter(10, 1),
 	}
 }
 
@@ -42,16 +46,24 @@ const (
 	IDFieldName         = "编号"
 	UpdateTimeFieldName = "更新时间"
 	CreateTimeFieldName = "申请时间"
+	WorkflowFieldName   = "当前流程状态"
 )
 
-func (c *LarkClient) CreateBatch(ctx context.Context, records []*larkbitable.AppTableRecord) error {
+func newClientToken() (string, error) {
 	var token [16]byte
 	if _, err := rand.Read(token[:]); err != nil {
-		return err
+		return "", err
 	}
 	token[6] = token[6]&0x0f | 0x40
 	token[8] = token[8]&0x3f | 0x80
-	clientToken := fmt.Sprintf("%x-%x-%x-%x-%x", token[:4], token[4:6], token[6:8], token[8:10], token[10:])
+	return fmt.Sprintf("%x-%x-%x-%x-%x", token[:4], token[4:6], token[6:8], token[8:10], token[10:]), nil
+}
+
+func (c *LarkClient) CreateBatch(ctx context.Context, records []*larkbitable.AppTableRecord) error {
+	clientToken, err := newClientToken()
+	if err != nil {
+		return err
+	}
 	req := larkbitable.NewBatchCreateAppTableRecordReqBuilder().
 		AppToken(c.AppToken).TableId(c.TableId).ClientToken(clientToken).
 		Body(larkbitable.NewBatchCreateAppTableRecordReqBodyBuilder().Records(records).Build()).Build()
@@ -191,6 +203,96 @@ func parseFields(fields map[string]string) (map[string]interface{}, error) {
 		}
 	}
 	return result, nil
+}
+
+func (c *LarkClient) ColumnNames(ctx context.Context) (map[string]bool, error) {
+	names := map[string]bool{}
+	tokens := map[string]bool{}
+	for token := ""; ; {
+		req := larkbitable.NewListAppTableFieldReqBuilder().AppToken(c.AppToken).TableId(c.TableId).PageSize(100)
+		if token != "" {
+			req.PageToken(token)
+		}
+		var data *larkbitable.ListAppTableFieldRespData
+		err := retryFeishu(ctx, "list_fields", c.listFieldLimit, func() error {
+			resp, err := c.Bitable.AppTableField.List(ctx, req.Build())
+			if err != nil {
+				return err
+			}
+			if err := feishuResponseError(resp.ApiResp, resp.CodeError); err != nil {
+				return err
+			}
+			data = resp.Data
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if data == nil {
+			return nil, errors.New("Feishu field list returned no data")
+		}
+		for _, field := range data.Items {
+			if field == nil || field.FieldName == nil {
+				return nil, errors.New("Feishu field list returned a field without a name")
+			}
+			names[*field.FieldName] = true
+		}
+		if data.HasMore == nil || !*data.HasMore {
+			return names, nil
+		}
+		if data.PageToken == nil || *data.PageToken == "" || tokens[*data.PageToken] {
+			return nil, errors.New("Feishu field list returned an invalid pagination token")
+		}
+		token = *data.PageToken
+		tokens[token] = true
+	}
+}
+
+func (c *LarkClient) EnsureColumns(ctx context.Context, existing map[string]bool, buckets ...[]*larkbitable.AppTableRecord) error {
+	missing := map[string]int{}
+	for _, bucket := range buckets {
+		for _, record := range bucket {
+			for name, value := range record.Fields {
+				if existing[name] {
+					continue
+				}
+				switch value.(type) {
+				case int64:
+					missing[name] = 5
+				case map[string]interface{}:
+					missing[name] = 15
+				default:
+					missing[name] = 1
+				}
+			}
+		}
+	}
+	names := make([]string, 0, len(missing))
+	for name := range missing {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		token, err := newClientToken()
+		if err != nil {
+			return err
+		}
+		req := larkbitable.NewCreateAppTableFieldReqBuilder().
+			AppToken(c.AppToken).TableId(c.TableId).ClientToken(token).
+			AppTableField(larkbitable.NewAppTableFieldBuilder().FieldName(name).Type(missing[name]).Build()).Build()
+		err = retryFeishu(ctx, "create_field", c.createFieldLimit, func() error {
+			resp, err := c.Bitable.AppTableField.Create(ctx, req)
+			if err != nil {
+				return err
+			}
+			return feishuResponseError(resp.ApiResp, resp.CodeError)
+		})
+		if err != nil {
+			return fmt.Errorf("create Feishu field %q: %w", name, err)
+		}
+		log.Info().Str("field", name).Int("type", missing[name]).Msg("Created Feishu column")
+	}
+	return nil
 }
 
 func (c *LarkClient) RecordIndex(ctx context.Context) (map[string][]string, error) {

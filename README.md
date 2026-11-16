@@ -41,7 +41,7 @@ docker-compose up
 ```
 
 ### Check output structure
-You should adjust lark bitable table structure to match the qflow view structure.
+The sync uses QingFlow field names and creates any missing Bitable columns. New columns use text, date, or link types based on the sync payload. Existing columns keep their types. The Feishu application needs permission to list fields and to create missing fields.
 
 ### Set `DRY_RUN` to `false` in `docker-compose.yml`
 ```yaml

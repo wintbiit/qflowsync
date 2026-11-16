@@ -112,6 +112,16 @@ func (c *QFlowClient) Map(r *FilterResponse) []map[string]string {
 		} else if item.ApplyBaseInfo.LastUpdateTime != "" {
 			m[UpdateTimeFieldName] = item.ApplyBaseInfo.LastUpdateTime
 		}
+		var nodes []string
+		for _, node := range item.ApplyBaseInfo.CurrentAuditNodes {
+			name := strings.TrimSpace(node.AuditNodeName)
+			if name != "" && !lo.Contains(nodes, name) {
+				nodes = append(nodes, name)
+			}
+		}
+		if len(nodes) > 0 {
+			m[WorkflowFieldName] = strings.Join(nodes, "、")
+		}
 		m["URL"] = fmt.Sprintf("https://qingflow.com/appView/%s/shareView/%s?applyId=%d", c.appId, c.viewId, item.ApplyId)
 
 		return m
