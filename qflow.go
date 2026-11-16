@@ -104,6 +104,14 @@ func (c *QFlowClient) Map(r *FilterResponse) []map[string]string {
 			return answer.QueTitle, answer.Values[0].Value
 		})
 
+		if item.ApplyBaseInfo.ApplyTime != "" {
+			m[CreateTimeFieldName] = item.ApplyBaseInfo.ApplyTime
+		}
+		if item.LastUpdateTime > 0 {
+			m[UpdateTimeFieldName] = time.UnixMilli(item.LastUpdateTime).Format(time.RFC3339Nano)
+		} else if item.ApplyBaseInfo.LastUpdateTime != "" {
+			m[UpdateTimeFieldName] = item.ApplyBaseInfo.LastUpdateTime
+		}
 		m["URL"] = fmt.Sprintf("https://qingflow.com/appView/%s/shareView/%s?applyId=%d", c.appId, c.viewId, item.ApplyId)
 
 		return m

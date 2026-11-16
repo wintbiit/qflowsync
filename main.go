@@ -108,7 +108,11 @@ func recordBuckets(records []map[string]string, index map[string][]string) (crea
 		}
 		numbers[number] = true
 		matches := index[number]
-		record := larkbitable.NewAppTableRecordBuilder().Fields(parseFields(item))
+		fields, err := parseFields(item)
+		if err != nil {
+			return nil, nil, fmt.Errorf("QingFlow record %d: %w", i+1, err)
+		}
+		record := larkbitable.NewAppTableRecordBuilder().Fields(fields)
 		switch len(matches) {
 		case 0:
 			create = append(create, record.Build())

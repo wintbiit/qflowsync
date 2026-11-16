@@ -159,3 +159,25 @@ func TestFeishuRetryPolicy(t *testing.T) {
 		t.Fatal("empty batch should be skipped")
 	}
 }
+
+func TestSyncRecordTimes(t *testing.T) {
+	var source FilterResponseDataItem
+	if err := json.Unmarshal([]byte(`{
+		"applyBaseInfo":{"applyTime":"2026-11-16T16:33:20","lastUpdateTime":"2026-11-16T16:33:19"},
+		"lastUpdateTime":1794818000123
+	}`), &source); err != nil {
+		t.Fatal(err)
+	}
+	qf := &QFlowClient{}
+	mapped := qf.Map(&FilterResponse{Data: FilterResponseData{List: []FilterResponseDataItem{source}}})
+	fields, err := parseFields(mapped[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fields[CreateTimeFieldName] != int64(1794818000000) || fields[UpdateTimeFieldName] != int64(1794818000123) {
+		t.Fatalf("incorrect timestamp conversion: created=%v updated=%v", fields[CreateTimeFieldName], fields[UpdateTimeFieldName])
+	}
+	if _, err := parseFields(map[string]string{CreateTimeFieldName: "invalid"}); err == nil {
+		t.Fatal("invalid timestamp should fail instead of writing the current time")
+	}
+}

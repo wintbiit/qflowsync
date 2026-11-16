@@ -17,7 +17,6 @@ import (
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkbitable "github.com/larksuite/oapi-sdk-go/v3/service/bitable/v1"
 	"github.com/rs/zerolog/log"
-	"github.com/samber/lo"
 )
 
 type LarkClient struct {
@@ -166,26 +165,32 @@ func feishuRetryDelay(err *feishuError, attempt int) (time.Duration, bool) {
 
 var tzLocation = time.FixedZone("CST", 8*60*60)
 
-func parseFields(fields map[string]string) map[string]interface{} {
-	return lo.MapEntries(fields, func(k string, v string) (string, interface{}) {
-		k = strings.TrimSpace(k)
-		if k == UpdateTimeFieldName || k == CreateTimeFieldName {
-			// 2024-11-24 20:15:35
-			t, err := time.ParseInLocation("2006-01-02 15:04:05", v, tzLocation)
+func parseFields(fields map[string]string) (map[string]interface{}, error) {
+	result := make(map[string]interface{}, len(fields))
+	for key, value := range fields {
+		key = strings.TrimSpace(key)
+		switch key {
+		case CreateTimeFieldName, UpdateTimeFieldName:
+			value = strings.TrimSpace(value)
+			if value == "" {
+				continue
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, value)
 			if err != nil {
-				log.Error().Err(err).Str("time", v).Msg("Failed to parse time")
-				t = time.Now()
+				local := strings.Replace(value, "T", " ", 1)
+				parsed, err = time.ParseInLocation("2006-01-02 15:04:05", local, tzLocation)
 			}
-
-			return k, t.UnixMilli()
-		} else if k == "URL" {
-			return k, map[string]interface{}{
-				"link": v,
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s: %w", key, err)
 			}
+			result[key] = parsed.UnixMilli()
+		case "URL":
+			result[key] = map[string]interface{}{"link": value}
+		default:
+			result[key] = value
 		}
-
-		return k, v
-	})
+	}
+	return result, nil
 }
 
 func (c *LarkClient) RecordIndex(ctx context.Context) (map[string][]string, error) {
