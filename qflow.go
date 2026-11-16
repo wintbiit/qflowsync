@@ -69,7 +69,7 @@ func NewQFlowClient(appId, viewId, cookies string) (*QFlowClient, error) {
 
 	jar.SetCookies(&qfUrl, parseCookies(cookies))
 
-	client := http.Client{Jar: jar}
+	client := http.Client{Jar: jar, Timeout: 20 * time.Second}
 
 	return &QFlowClient{
 		appId:  appId,

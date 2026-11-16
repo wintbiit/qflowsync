@@ -26,7 +26,7 @@ type LarkClient struct {
 
 func NewLarkClient(appId, appSecret, appToken, tableId string) *LarkClient {
 	return &LarkClient{
-		Client:   lark.NewClient(appId, appSecret),
+		Client:   lark.NewClient(appId, appSecret, lark.WithReqTimeout(20*time.Second)),
 		AppToken: appToken,
 		TableId:  tableId,
 	}
@@ -38,24 +38,9 @@ const (
 	CreateTimeFieldName = "申请时间"
 )
 
-func (c *LarkClient) WriteRecord(ctx context.Context, rec map[string]string) (bool, error) {
-	id := rec[IDFieldName]
-	if strings.TrimSpace(id) == "" {
-		return false, errors.New("missing record number")
-	}
-
-	var exists bool
-	var recordID string
-	if err := retryLark(ctx, "search", func() error {
-		var err error
-		exists, recordID, err = c.RecordExists(ctx, id)
-		return err
-	}); err != nil {
-		return false, err
-	}
-
+func (c *LarkClient) WriteRecord(ctx context.Context, recordID string, rec map[string]string) (bool, error) {
 	fields := parseFields(rec)
-	if exists {
+	if recordID != "" {
 		return false, retryLark(ctx, "update", func() error {
 			return c.UpdateRecord(ctx, recordID, fields)
 		})
@@ -129,47 +114,86 @@ func parseFields(fields map[string]string) map[string]interface{} {
 	})
 }
 
-// 15 searches per second.
-var recordExistsLimiter = rate.NewLimiter(rate.Every(time.Second/15), 1)
+func (c *LarkClient) RecordIndex(ctx context.Context) (map[string][]string, error) {
+	index := make(map[string][]string)
+	tokens := make(map[string]bool)
+	token := ""
+	for {
+		req := larkbitable.NewSearchAppTableRecordReqBuilder().
+			AppToken(c.AppToken).
+			TableId(c.TableId).
+			PageSize(500).
+			Body(larkbitable.NewSearchAppTableRecordReqBodyBuilder().
+				FieldNames([]string{IDFieldName}).
+				AutomaticFields(false).
+				Build())
+		if token != "" {
+			req.PageToken(token)
+		}
+		var data *larkbitable.SearchAppTableRecordRespData
+		if err := retryLark(ctx, "search", func() error {
+			resp, err := c.Bitable.AppTableRecord.Search(ctx, req.Build())
+			if err != nil {
+				return err
+			}
+			if !resp.Success() {
+				return resp.CodeError
+			}
+			data = resp.Data
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		if data == nil {
+			return nil, errors.New("Feishu search returned no data")
+		}
 
-func (c *LarkClient) RecordExists(ctx context.Context, id string) (bool, string, error) {
-	if err := recordExistsLimiter.Wait(ctx); err != nil {
-		return false, "", err
+		for _, item := range data.Items {
+			if item == nil || item.RecordId == nil || *item.RecordId == "" {
+				return nil, errors.New("Feishu search returned a record without an ID")
+			}
+			number, err := feishuRecordNumber(item.Fields[IDFieldName])
+			if err != nil {
+				return nil, err
+			}
+			if number != "" {
+				index[number] = append(index[number], *item.RecordId)
+			}
+		}
+		if data.HasMore == nil || !*data.HasMore {
+			return index, nil
+		}
+		if data.PageToken == nil || *data.PageToken == "" || tokens[*data.PageToken] {
+			return nil, errors.New("Feishu search returned an invalid pagination token")
+		}
+		token = *data.PageToken
+		tokens[token] = true
 	}
+}
 
-	req := larkbitable.NewSearchAppTableRecordReqBuilder().
-		AppToken(c.AppToken).
-		TableId(c.TableId).
-		PageSize(1).
-		Body(larkbitable.NewSearchAppTableRecordReqBodyBuilder().
-			FieldNames([]string{IDFieldName}).
-			Filter(larkbitable.NewFilterInfoBuilder().
-				Conjunction("and").
-				Conditions([]*larkbitable.Condition{
-					larkbitable.NewConditionBuilder().
-						FieldName(IDFieldName).
-						Operator("is").Value([]string{id}).
-						Build(),
-				}).Build()).
-			AutomaticFields(false).
-			Build()).
-		Build()
-
-	// 发起请求
-	resp, err := c.Bitable.AppTableRecord.Search(ctx, req)
-	if err != nil {
-		return false, "", err
+func feishuRecordNumber(value interface{}) (string, error) {
+	switch value := value.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return strings.TrimSpace(value), nil
+	case []interface{}:
+		var number strings.Builder
+		for _, part := range value {
+			field, ok := part.(map[string]interface{})
+			if !ok {
+				return "", errors.New("unexpected Feishu record number segment")
+			}
+			text, ok := field["text"].(string)
+			if !ok {
+				return "", errors.New("Feishu record number segment has no text")
+			}
+			number.WriteString(text)
+		}
+		return strings.TrimSpace(number.String()), nil
+	default:
+		return "", fmt.Errorf("unexpected Feishu record number type %T", value)
 	}
-
-	if !resp.Success() {
-		return false, "", resp.CodeError
-	}
-
-	if len(resp.Data.Items) == 0 {
-		return false, "", nil
-	}
-
-	return true, *resp.Data.Items[0].RecordId, nil
 }
 
 // Pace creates and updates through the same limiter.
